@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 开发临时文件
+test_logic.py
+test_gui.py
+inspect_session*.py
+*.log
+
+# 系统
+Thumbs.db
+.DS_Store
