@@ -3,7 +3,8 @@
 鲸鱼娘余额挂件（独立版）
 - 不依赖 DeepSeek Harness，可单独运行
 - 沿用原挂件的鲸鱼娘图片素材与价格/记账逻辑
-- 显示：当前时段 token 价格、今日消费、剩余额度、本轮消耗
+- 显示：当前时段 token 价格、今日消费、剩余额度、本轮消耗、上一轮对话消耗
+- 支持：右键菜单调整大小、更换图片（配置持久化）
 """
 import json
 import os
@@ -12,6 +13,7 @@ import threading
 import datetime
 import urllib.request
 import tkinter as tk
+from tkinter import filedialog
 
 # ---------------- 配置与路径 ----------------
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -20,6 +22,7 @@ DSH_HOME = os.path.join(os.path.expanduser("~"), ".dsh")
 CRED_FILE = os.path.join(DSH_HOME, ".credentials.yaml")
 LEDGER_FILE = os.path.join(DSH_HOME, ".dshw-usage.json")
 SESSION_CACHE_DIR = os.path.join(DSH_HOME, "storages", "session_projcache", "sessions")
+CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 BALANCE_URL = "https://api.deepseek.com/user/balance"
 REFRESH_MS = 60000  # 60 秒自动刷新
 
@@ -27,6 +30,9 @@ MODEL = "deepseek-v4-pro"
 # DeepSeek CNY 价格每百万 token：[谷价, 峰价]
 PEAK_HOURS = [(9, 12), (14, 18)]  # 工作日 9:00-12:00、14:00-18:00（北京时间），周末全天谷价
 PRO_PRICE = {"hit": (0.15, 0.3), "miss": (4.5, 9.0), "out": (13.5, 27.0)}
+
+SIZE_PRESETS = {"小": 0.7, "默认": 1.0, "大": 1.4}
+BASE_IMG_W = 240
 
 
 def beijing_now():
@@ -45,6 +51,25 @@ def current_price():
     peak = is_peak()
     out = PRO_PRICE["out"][1 if peak else 0]
     return peak, out
+
+
+def load_config():
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+            if isinstance(d, dict):
+                return d
+    except Exception:
+        pass
+    return {}
+
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False)
+    except Exception:
+        pass
 
 
 def read_api_key():
@@ -138,11 +163,7 @@ def fetch_balance(key):
 
 
 def read_last_turn_cost():
-    """读取 DSH 最近一次对话（上一轮）的消耗金额。
-
-    从 DSH 的会话投影缓存里取 tokenUsage.last.buckets（上一轮 token 用量），
-    按当前峰谷价折算成金额。无数据/解析失败返回 None。
-    """
+    """读取 DSH 最近一次对话（上一轮）的消耗金额。"""
     try:
         if not os.path.isdir(SESSION_CACHE_DIR):
             return None
@@ -157,9 +178,9 @@ def read_last_turn_cost():
         if not last:
             return None
         buckets = last.get("buckets") or {}
-        miss = int(buckets.get("uncachedInputTokens") or 0)   # 未命中缓存输入
-        hit = int(buckets.get("cacheReadTokens") or 0)         # 命中缓存输入
-        out = int(buckets.get("outputTokens") or 0)            # 输出
+        miss = int(buckets.get("uncachedInputTokens") or 0)
+        hit = int(buckets.get("cacheReadTokens") or 0)
+        out = int(buckets.get("outputTokens") or 0)
         if miss == 0 and hit == 0 and out == 0:
             return None
         idx = 1 if is_peak() else 0
@@ -184,9 +205,17 @@ GOLD = "#f0c060"
 class WhaleWidget:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.overrideredirect(True)  # 无边框
-        self.root.attributes("-topmost", True)  # 置顶
+        self.root.overrideredirect(True)
+        self.root.attributes("-topmost", True)
         self.root.configure(bg=BG)
+
+        # 配置：大小 + 图片
+        self.config = load_config()
+        self.image_path = self.config.get("image", WHALE_IMG)
+        try:
+            self.size_scale = float(self.config.get("size", 1.0))
+        except Exception:
+            self.size_scale = 1.0
 
         self.api_key = read_api_key()
         self.balance = None
@@ -195,37 +224,37 @@ class WhaleWidget:
         self.session_start = None
         self.session_usage = 0.0
         self.error = None
-        self._fetching = False  # 防止线程重叠
+        self._fetching = False
 
         self._build_ui()
+        self._build_menu()
         self._position_bottom_right()
 
         # 拖动
         self._drag = None
         self.root.bind("<Button-1>", self._start_drag)
         self.root.bind("<B1-Motion>", self._do_drag)
-
-        # 关闭
         self.root.bind("<Escape>", lambda e: self.root.destroy())
 
         self._refresh()
         self.root.after(REFRESH_MS, self._auto_refresh)
 
+    def _font(self, size, bold=False):
+        weight = "bold" if bold else "normal"
+        return ("Microsoft YaHei UI", max(7, int(size * self.size_scale)), weight)
+
     def _build_ui(self):
-        # 外框
         outer = tk.Frame(self.root, bg=BG, bd=0)
         outer.pack(fill="both", expand=True)
 
-        # 标题栏
         head = tk.Frame(outer, bg=BG)
         head.pack(fill="x", padx=12, pady=(10, 0))
         tk.Label(head, text="🐋 鲸鱼娘 · 余额", bg=BG, fg=FG,
-                 font=("Microsoft YaHei UI", 11, "bold")).pack(side="left")
-        close = tk.Label(head, text="✕", bg=BG, fg=DIM, font=("Microsoft YaHei UI", 12))
+                 font=self._font(11, True)).pack(side="left")
+        close = tk.Label(head, text="✕", bg=BG, fg=DIM, font=self._font(12))
         close.pack(side="right")
         close.bind("<Button-1>", lambda e: self.root.destroy())
 
-        # 信息面板
         panel = tk.Frame(outer, bg=PANEL)
         panel.pack(fill="x", padx=12, pady=8)
 
@@ -235,39 +264,86 @@ class WhaleWidget:
         self.lbl_turn = self._row(panel, "本轮消耗", "…", 3)
         self.lbl_lastturn = self._row(panel, "上一轮对话", "…", 4)
 
-        # 状态提示（错误/更新时间）
-        self.status = tk.Label(outer, text="正在加载…", bg=BG, fg=DIM,
-                               font=("Microsoft YaHei UI", 8))
+        self.status = tk.Label(outer, text="正在加载…", bg=BG, fg=DIM, font=self._font(8))
         self.status.pack(fill="x", padx=12, pady=(0, 4))
 
-        # 鲸鱼娘图片
         self.photo = None
         self.img_label = tk.Label(outer, bg=BG, bd=0, cursor="hand2")
         self.img_label.pack(side="bottom", fill="x")
         self.img_label.bind("<Button-1>", self._manual_refresh)
         self._load_image()
 
+    def _build_menu(self):
+        menu = tk.Menu(self.root, tearoff=0)
+        size_menu = tk.Menu(menu, tearoff=0)
+        for label, scale in SIZE_PRESETS.items():
+            size_menu.add_command(label=label, command=lambda s=scale: self._set_size(s))
+        menu.add_cascade(label="大小", menu=size_menu)
+        menu.add_command(label="更换图片", command=self._change_image)
+        menu.add_command(label="恢复默认图片", command=self._reset_image)
+        menu.add_command(label="立即刷新", command=self._manual_refresh)
+        menu.add_separator()
+        menu.add_command(label="关闭", command=self.root.destroy)
+        self.menu = menu
+        self.root.bind("<Button-3>", self._popup_menu)
+
+    def _popup_menu(self, e):
+        try:
+            self.menu.tk_popup(e.x_root, e.y_root)
+        finally:
+            self.menu.grab_release()
+
     def _row(self, parent, label, value, idx):
         row = tk.Frame(parent, bg=PANEL)
         row.pack(fill="x", padx=12, pady=6)
-        tk.Label(row, text=label, bg=PANEL, fg=DIM,
-                 font=("Microsoft YaHei UI", 9)).pack(side="left")
-        val = tk.Label(row, text=value, bg=PANEL, fg=FG,
-                       font=("Microsoft YaHei UI", 10, "bold"))
+        tk.Label(row, text=label, bg=PANEL, fg=DIM, font=self._font(9)).pack(side="left")
+        val = tk.Label(row, text=value, bg=PANEL, fg=FG, font=self._font(10, True))
         val.pack(side="right")
         return val
 
     def _load_image(self):
         try:
             from PIL import Image, ImageTk
-            img = Image.open(WHALE_IMG).convert("RGBA")
-            w = 240
+            img = Image.open(self.image_path).convert("RGBA")
+            w = int(BASE_IMG_W * self.size_scale)
             h = int(img.height * w / img.width)
             img = img.resize((w, h), Image.LANCZOS)
             self.photo = ImageTk.PhotoImage(img)
-            self.img_label.configure(image=self.photo)
+            self.img_label.configure(image=self.photo, text="")
         except Exception as e:
-            self.img_label.configure(text="(图片加载失败)", fg=DIM)
+            self.photo = None
+            self.img_label.configure(image="", text="(图片加载失败)", fg=DIM)
+
+    def _set_size(self, scale):
+        self.size_scale = scale
+        self.config["size"] = scale
+        save_config(self.config)
+        self._load_image()
+        # 字体缩放需要重建 UI
+        self._rebuild_ui()
+
+    def _change_image(self):
+        path = filedialog.askopenfilename(
+            title="选择图片",
+            filetypes=[("图片", "*.png *.jpg *.jpeg *.gif *.bmp"), ("所有文件", "*.*")])
+        if path:
+            self.image_path = path
+            self.config["image"] = path
+            save_config(self.config)
+            self._load_image()
+
+    def _reset_image(self):
+        self.image_path = WHALE_IMG
+        self.config.pop("image", None)
+        save_config(self.config)
+        self._load_image()
+
+    def _rebuild_ui(self):
+        # 简单起见：销毁子控件重建（保持拖动/菜单绑定）
+        for w in self.root.winfo_children():
+            w.destroy()
+        self._build_ui()
+        self._position_bottom_right()
 
     def _position_bottom_right(self):
         self.root.update_idletasks()
@@ -301,7 +377,6 @@ class WhaleWidget:
         threading.Thread(target=self._fetch_worker, daemon=True).start()
 
     def _safe_after(self, fn, *args):
-        """线程安全地回到主线程刷新 UI；窗口已销毁时静默忽略。"""
         try:
             self.root.after(0, fn, *args)
         except Exception:
