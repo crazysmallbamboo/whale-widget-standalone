@@ -24,9 +24,10 @@
   - **大小**：小 / 默认 / 大三档缩放（图片 + 字体）
   - **更换图片**：选择任意 PNG/JPG/GIF 图片替换鲸鱼娘
   - **恢复默认图片**：换回自带鲸鱼娘素材
+  - **设置 API Key**：手动填入 DeepSeek API Key（保存到本地 `config.json`，无需 DSH）
   - 立即刷新 / 关闭
 
-大小与图片选择会**自动保存**到 `config.json`，下次打开沿用。
+大小、图片与 API Key 都会**自动保存**到 `config.json`，下次打开沿用。
 
 ## 环境要求
 
@@ -43,10 +44,12 @@ pip install pillow
 ## 使用
 
 1. 双击 `鲸鱼余额挂件.bat`（或运行 `pythonw whale_widget.pyw`）
-2. 挂件自动从 `~/.dsh/.credentials.yaml` 读取 `DEEPSEEK_API_KEY`
+2. **配置 API Key（二选一）**：
+   - 右键 → **设置 API Key**，手动填入（保存到本地 `config.json`，推荐，无需 DSH）
+   - 或使用 `~/.dsh/.credentials.yaml` 里的 `DEEPSEEK_API_KEY`（如果装了 DSH）
 3. 右键可调整大小、更换图片
 
-> 没有 DSH 也可以直接运行；只要配置了 `DEEPSEEK_API_KEY` 就能显示余额。想开机自启，把 `.bat` 快捷方式放进「启动」文件夹即可。
+> 完全不依赖 DSH：图片素材已内置，API Key 可手动配置。想开机自启，把 `.bat` 快捷方式放进「启动」文件夹即可。
 
 ## 工作原理
 

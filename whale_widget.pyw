@@ -73,6 +73,14 @@ def save_config(cfg):
 
 
 def read_api_key():
+    # 1. 优先读挂件自己的 config.json（不依赖 DSH）
+    try:
+        cfg = load_config()
+        if cfg.get("api_key"):
+            return str(cfg["api_key"])
+    except Exception:
+        pass
+    # 2. 回退到 DSH 凭据文件
     try:
         with open(CRED_FILE, encoding="utf-8") as f:
             m = re.search(r"DEEPSEEK_API_KEY:\s*(sk-\S+)", f.read())
@@ -281,6 +289,7 @@ class WhaleWidget:
         menu.add_cascade(label="大小", menu=size_menu)
         menu.add_command(label="更换图片", command=self._change_image)
         menu.add_command(label="恢复默认图片", command=self._reset_image)
+        menu.add_command(label="设置 API Key", command=self._set_api_key)
         menu.add_command(label="立即刷新", command=self._manual_refresh)
         menu.add_separator()
         menu.add_command(label="关闭", command=self.root.destroy)
@@ -337,6 +346,26 @@ class WhaleWidget:
         self.config.pop("image", None)
         save_config(self.config)
         self._load_image()
+
+    def _set_api_key(self):
+        from tkinter import simpledialog
+        key = simpledialog.askstring(
+            "设置 API Key", "请输入 DeepSeek API Key（sk-...）：",
+            parent=self.root, initialvalue=self.api_key or "")
+        if key is not None:
+            key = key.strip()
+            if key:
+                self.config["api_key"] = key
+                save_config(self.config)
+                self.api_key = key
+            else:
+                # 清空则回退到 DSH 凭据
+                self.config.pop("api_key", None)
+                save_config(self.config)
+                self.api_key = read_api_key()
+            self.session_start = None
+            self.session_usage = 0.0
+            self._refresh()
 
     def _rebuild_ui(self):
         # 简单起见：销毁子控件重建（保持拖动/菜单绑定）
