@@ -8,6 +8,7 @@ test_logic.py
 test_gui.py
 inspect_session*.py
 *.log
+config.json
 
 # 系统
 Thumbs.db
