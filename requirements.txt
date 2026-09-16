@@ -1,0 +1,2 @@
+keyring>=25
+Pillow>=10
