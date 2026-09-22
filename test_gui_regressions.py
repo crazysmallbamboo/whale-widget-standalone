@@ -11,6 +11,8 @@
   7. 配置写不进去时要提示，不能无声失败
   8. 拖边框能自由缩放：八个方向都能抓、对边钉住、字号同步、有上下限、有悬停提示
   9. 更换图片 / 恢复默认图片必须真的换掉画面（不能因为渲染缓存而纹丝不动）
+ 10. 大图要先降采样再缓存、鼠标滑出边框要复位高亮、凭据带引号也要能读、
+     坏图片路径要自动退回自带素材、点边框没拖动不该写盘
 
 用法：在仓库目录直接运行 `python test_gui_regressions.py`
 所有路径都相对本脚本解析，并把配置 / 账本 / 凭据重定向到临时目录，
@@ -289,6 +291,103 @@ else:
     check("同图同尺寸不重复重建 PhotoImage", id(w.photo), photo2)
 
     mod.filedialog.askopenfilename = real_ask
+
+print("\n=== 11. 大图降采样、滑出复位、凭据引号、坏图片路径 ===")
+
+# 大图必须先降采样再缓存：否则拖动边框每帧都从全分辨率重采样，
+# 实测 4000x3000 每帧 130ms、6000x4500 每帧 254ms。
+cap = int(mod.BASE_IMG_W * mod.MAX_SCALE * 2)
+try:
+    from PIL import Image
+    big_img = os.path.join(TMP, "big.png")
+    Image.new("RGBA", (4000, 3000), (10, 20, 30, 255)).save(big_img)
+except Exception:
+    big_img = None
+
+if big_img:
+    real_ask2 = mod.filedialog.askopenfilename
+    mod.filedialog.askopenfilename = lambda **kw: big_img
+    w._change_image()
+    w.root.update()
+    check("大图缓存被限制在上限内", w._src_img.width <= cap, True)
+    check("大图缓存宽度正好压到上限", w._src_img.width, cap)
+    check("大图仍然正常显示", w.photo is not None, True)
+    mod.filedialog.askopenfilename = real_ask2
+    w._reset_image()
+    w.root.update()
+
+# 鼠标从边框直接滑出挂件时 <Motion> 不再触发，必须靠 <Leave> 复位
+w.root.update()
+Wn, Hn = w.root.winfo_width(), w.root.winfo_height()
+w._on_motion(ev(w, Wn - 2, Hn // 2))
+check("滑到边框上会高亮", w.border.cget("bg"), mod.ACCENT)
+w.root.event_generate("<Leave>")
+w.root.update()
+check("滑出后边框复位", w.border.cget("bg"), mod.BORDER)
+check("滑出后窗口指针复位", w.root.cget("cursor"), "")
+check("滑出后图片指针恢复 hand2", w.img_label.cget("cursor"), "hand2")
+
+w._start_drag(ev(w, Wn - 2, Hn // 2))
+check("按下边框即点亮", w.border.cget("bg"), mod.ACCENT)
+w.root.event_generate("<Leave>")
+w.root.update()
+check("拖动中滑出仍保持高亮", w.border.cget("bg"), mod.ACCENT)
+w._end_drag()
+
+# 凭据文件里的值可能被引号包起来，两种引号都要认
+cred_key = "sk-" + "b" * 24
+for quote, label in (("", "裸值"), ('"', "双引号"), ("'", "单引号")):
+    with open(mod.CRED_FILE, "w", encoding="utf-8") as fh:
+        fh.write("records:\n  DEEPSEEK_API_KEY: %s%s%s\n" % (quote, cred_key, quote))
+    check("凭据「%s」能解析出 Key" % label, mod.read_api_key(), cred_key)
+
+# 选了不是图片的文件，不能把坏路径写进配置
+not_img = os.path.join(TMP, "notimage.txt")
+with open(not_img, "w", encoding="utf-8") as fh:
+    fh.write("这不是图片")
+real_ask3 = mod.filedialog.askopenfilename
+mod.filedialog.askopenfilename = lambda **kw: not_img
+image_before = w.config.get("image")
+file_before = read_saved_config().get("image")
+w._change_image()
+w.root.update()
+check("非图片文件不会被写进内存配置", w.config.get("image"), image_before)
+check("非图片文件不会被写进配置文件", read_saved_config().get("image"), file_before)
+check("非图片文件时屏幕仍是原图", w.photo is not None, True)
+check("非图片文件时状态栏有提示", "不是能用的图片" in w.status.cget("text"), True)
+mod.filedialog.askopenfilename = real_ask3
+
+# 配置里留了失效图片路径时，启动要自动退回自带素材（不能一直显示「图片加载失败」）
+stale = read_saved_config()
+stale["image"] = os.path.join(TMP, "never_existed.png")
+with open(mod.CONFIG_FILE, "w", encoding="utf-8") as fh:
+    json.dump(stale, fh)
+w.root.destroy()
+w = mod.WhaleWidget()
+w.root.update()
+check("坏图片路径启动时自动退回自带素材",
+      os.path.basename(w._src_path or ""), "DSniang1.png")
+check("退回后画面正常显示", w.photo is not None, True)
+check("退回后界面上没有报错文字", w.img_label.cget("text"), "")
+check("退回后坏路径从内存配置里清掉", "image" in w.config, False)
+
+# 在边框上点一下但没拖动，不该写盘
+try:
+    os.remove(mod.CONFIG_FILE)
+except OSError:
+    pass
+w.root.update()
+Wm, Hm = w.root.winfo_width(), w.root.winfo_height()
+w._start_drag(ev(w, Wm - 2, Hm // 2))
+w._end_drag()
+check("点边框未拖动不写配置", os.path.exists(mod.CONFIG_FILE), False)
+
+scale_before = w.size_scale
+w._start_drag(ev(w, Wm - 2, Hm // 2))
+w._do_resize(w.root.winfo_rootx() + Wm + 40, w.root.winfo_rooty() + Hm // 2, force=True)
+w._end_drag()
+check("真正拖动后写了配置", os.path.exists(mod.CONFIG_FILE), True)
+check("写进去的尺寸确实变了", abs(w.size_scale - scale_before) > 0.01, True)
 
 w.root.destroy()
 shutil.rmtree(TMP, ignore_errors=True)

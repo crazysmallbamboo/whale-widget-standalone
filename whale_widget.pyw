@@ -102,7 +102,8 @@ def read_api_key():
     # 2. 回退到 DSH 凭据文件
     try:
         with open(CRED_FILE, encoding="utf-8") as f:
-            m = re.search(r"DEEPSEEK_API_KEY:\s*(sk-\S+)", f.read())
+            # 值可能被引号包起来（DEEPSEEK_API_KEY: "sk-..."），两种引号都要认
+            m = re.search(r"""DEEPSEEK_API_KEY:\s*["']?(sk-[^\s"']+)["']?""", f.read())
             return m.group(1) if m else None
     except Exception:
         return None
@@ -341,6 +342,7 @@ class WhaleWidget:
         self.root.bind("<B1-Motion>", self._do_drag)
         self.root.bind("<ButtonRelease-1>", self._end_drag)
         self.root.bind("<Motion>", self._on_motion)
+        self.root.bind("<Leave>", self._on_leave)
         self.root.bind("<Escape>", lambda e: self._close())
         self.root.protocol("WM_DELETE_WINDOW", self._close)
 
@@ -448,32 +450,77 @@ class WhaleWidget:
         val.pack(side="right")
         return val
 
+    def _open_source(self, path):
+        """读入一张图并缓存，失败返回 None。
+
+        太大的先降采样：渲染宽度最大只有 BASE_IMG_W * MAX_SCALE，
+        把手机照片那种几千万像素的原图整张留着没有意义 —— 拖动边框时
+        每帧都要从全分辨率重采样，实测 4000x3000 每帧 130ms、
+        6000x4500 每帧 254ms 并常驻 100MB。
+        """
+        try:
+            from PIL import Image
+            img = Image.open(path).convert("RGBA")
+        except Exception:
+            return None
+        cap = int(BASE_IMG_W * MAX_SCALE * 2)
+        if img.width > cap:
+            img = img.resize((cap, max(1, int(round(img.height * cap / float(img.width))))),
+                             Image.LANCZOS)
+        return img
+
     def _load_image(self):
+        """把当前 image_path 渲染到界面上，返回是否成功。
+
+        读不到时自动退回自带素材：配置里可能留着一个失效路径
+        （上次选了非图片文件，或那个文件被删了/移走了），
+        不兜底的话挂件会一直显示「图片加载失败」。
+        """
         try:
             from PIL import Image, ImageTk
-            # 原图缓存：拖动边框时每帧都会走到这里，不能反复读磁盘
-            if self._src_img is None or self._src_path != self.image_path:
-                self._src_img = Image.open(self.image_path).convert("RGBA")
-                self._src_path = self.image_path
-            img = self._src_img
-            w = max(24, int(BASE_IMG_W * self.size_scale))
-            # 缓存的 key 必须同时包含「哪张图」和「渲染宽度」：
-            # 只比宽度的话，换图后宽度没变会直接 return，画面根本不会更新
-            # （「更换图片」「恢复默认图片」都会失效）。
-            key = (self.image_path, w)
-            if self.photo is not None and self._photo_key == key:
-                return  # 同一张图、同一个尺寸，不必重建 PhotoImage
-            h = max(24, int(img.height * w / img.width))
-            resized = img.resize((w, h), Image.LANCZOS)
-            self.photo = ImageTk.PhotoImage(resized)
-            self._photo_key = key
-            self.img_label.configure(image=self.photo, text="")
         except Exception:
             self.photo = None
             self._photo_key = None
-            self._src_img = None
-            self._src_path = None
+            self.img_label.configure(image="", text="(缺少 Pillow)", fg=DIM)
+            return False
+
+        if self._src_img is None or self._src_path != self.image_path:
+            img = self._open_source(self.image_path)
+            if img is None and self.image_path != WHALE_IMG:
+                # 配置里的图用不了 → 退回自带鲸鱼，并顺手把坏路径从内存配置里去掉
+                self.image_path = WHALE_IMG
+                self.config.pop("image", None)
+                img = self._open_source(WHALE_IMG)
+            if img is None:
+                self.photo = None
+                self._photo_key = None
+                self._src_img = None
+                self._src_path = None
+                self.img_label.configure(image="", text="(图片加载失败)", fg=DIM)
+                return False
+            self._src_img = img
+            self._src_path = self.image_path
+            self._photo_key = None
+
+        img = self._src_img
+        w = max(24, int(BASE_IMG_W * self.size_scale))
+        # 缓存的 key 必须同时包含「哪张图」和「渲染宽度」：
+        # 只比宽度的话，换图后宽度没变会直接 return，画面根本不会更新
+        # （「更换图片」「恢复默认图片」都会失效）。
+        key = (self.image_path, w)
+        if self.photo is not None and self._photo_key == key:
+            return True  # 同一张图、同一个尺寸，不必重建 PhotoImage
+        try:
+            h = max(24, int(img.height * w / img.width))
+            self.photo = ImageTk.PhotoImage(img.resize((w, h), Image.LANCZOS))
+            self._photo_key = key
+            self.img_label.configure(image=self.photo, text="")
+            return True
+        except Exception:
+            self.photo = None
+            self._photo_key = None
             self.img_label.configure(image="", text="(图片加载失败)", fg=DIM)
+            return False
 
     def _apply_scale(self, scale):
         """按比例缩放整个挂件（图片 + 字号）。
@@ -501,21 +548,37 @@ class WhaleWidget:
         self.config["size"] = round(self.size_scale, 4)
         self._save_config_or_warn()
 
+    def _use_image(self, path, keep_key=None):
+        """把挂件图片换成 path。
+
+        先确认真能读出来再改 —— 否则选了非图片文件会把坏路径存进配置，
+        下次启动就只剩「图片加载失败」。读图只做一次，结果直接塞进缓存。
+        """
+        img = self._open_source(path)
+        if img is None:
+            self._set_status("这个文件不是能用的图片，已保持原图")
+            return False
+        self.image_path = path
+        self._src_img = img          # 直接复用刚读到的，不再重复解码
+        self._src_path = path
+        self._photo_key = None
+        if keep_key is None:
+            self.config["image"] = path
+        else:
+            self.config.pop(keep_key, None)
+        self._save_config_or_warn()
+        self._load_image()
+        return True
+
     def _change_image(self):
         path = filedialog.askopenfilename(
             title="选择图片",
             filetypes=[("图片", "*.png *.jpg *.jpeg *.gif *.bmp"), ("所有文件", "*.*")])
         if path:
-            self.image_path = path
-            self.config["image"] = path
-            self._save_config_or_warn()
-            self._load_image()
+            self._use_image(path)
 
     def _reset_image(self):
-        self.image_path = WHALE_IMG
-        self.config.pop("image", None)
-        self._save_config_or_warn()
-        self._load_image()
+        self._use_image(WHALE_IMG, keep_key="image")
 
     def _ask_api_key(self):
         """自建输入对话框：输入掩码显示，且不预填现有 Key（避免明文暴露）。"""
@@ -669,6 +732,15 @@ class WhaleWidget:
         x, y = self._local_xy(e)
         self._hover(self._zone_at(x, y))
 
+    def _on_leave(self, e):
+        """鼠标直接从边框滑出挂件时，<Motion> 就不会再触发了，必须在这里复位。
+
+        否则边框会一直亮着、指针也一直停在缩放箭头上，看起来像卡住了。
+        """
+        if self._resize or self._drag:
+            return  # 拖动过程中指针短暂移出窗口是正常的，别把高亮清掉
+        self._hover(None)
+
     def _start_drag(self, e):
         x, y = self._local_xy(e)
         zone = self._zone_at(x, y)
@@ -684,6 +756,8 @@ class WhaleWidget:
                 "last": (e.x_root, e.y_root),
             }
             self._drag = None
+            # 再点亮一次：不管鼠标是怎么来到边框上的，一开始拖就必须有反馈
+            self._hover(zone)
             return
         self._drag = (e.x_root - self.root.winfo_x(), e.y_root - self.root.winfo_y())
         self._drag_origin = self._current_pos()
@@ -743,15 +817,18 @@ class WhaleWidget:
     def _end_drag(self, e=None):
         """松手才写配置，且没变就不写（避免每次点击都落盘）。"""
         if self._resize:
+            start_scale = self._resize["scale"]
             last = self._resize.get("last")
             if last:
                 # 补一次最终位置，把被节流丢掉的那一小段补上
                 self._do_resize(last[0], last[1], force=True)
+            changed = abs(self.size_scale - start_scale) > 1e-4
             self._resize = None
             self._hover(None)
-            self.config["size"] = round(self.size_scale, 4)
-            self._save_config_or_warn()
-            return
+            if changed:
+                self.config["size"] = round(self.size_scale, 4)
+                self._save_config_or_warn()
+            return  # 只是在边框上点了一下、尺寸没变，就不必写盘
         if self._drag is None:
             return
         self._drag = None
