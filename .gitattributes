@@ -4,12 +4,14 @@
 # 批处理启动器必须保持 CRLF：cmd.exe 用 LF 行尾解析会把中文行的字节按 GBK 拆出
 # `&` 之类的元字符，并把 goto 标签认错，导致启动器直接失效。
 #
-# 这里用 `-text`（而不是 `text eol=crlf`）关闭一切行尾转换，让仓库里的 blob
-# 本身就带 CRLF。这样 clone、网页「Download ZIP」、以及 raw 单文件下载
-# 三条路径拿到的都是 CRLF；若用 `text eol=crlf`，raw 仍会吐出 LF 而把人坑到。
+# 这里用 `-text -eol` 彻底关闭行尾转换，让仓库里的 blob 本身就带 CRLF。
+# 注意两个都要取消：只写 `-text` 的话，上面那条 `* text=auto eol=lf` 设下的
+# `eol=lf` 仍然生效，blob 依旧会被存成 LF（踩过一次，clone 出来直接失效）。
+# 这样 clone、网页「Download ZIP」、以及 raw 单文件下载三条路径拿到的都是 CRLF；
+# 若改用 `text eol=crlf`，raw 仍会吐出 LF 而把人坑到。
 # 代价：改动该文件时必须保持 CRLF（tests.py 里有对应的 CRLF 自检）。
-*.bat -text
-*.cmd -text
+*.bat -text -eol
+*.cmd -text -eol
 
 # 二进制素材不做任何行尾转换
 *.png binary
