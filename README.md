@@ -112,7 +112,7 @@ pip install pillow
 ```powershell
 python tests.py                 # 42 项逻辑自检（价格表、峰谷判定、账本、币种选择、路径隔离、启动器）
 python test_fresh_user.py       # 14 项「全新用户」模拟：拷到临时目录、清空环境，验证无 DSH 也能记账
-python test_gui_regressions.py  # 56 项 GUI 交互回归（位置保持/恢复、失败保留数据、拖边框缩放、静默失败可报告）
+python test_gui_regressions.py  # 67 项 GUI 交互回归（位置、拖边框缩放、换图/恢复默认、失败保留数据）
 python test_gui_nokey.py        # 无 Key 时启动 GUI，确认不崩溃并给出「未找到 API Key」提示
 ```
 

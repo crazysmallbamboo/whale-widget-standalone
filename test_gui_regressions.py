@@ -10,6 +10,7 @@
   6. 后台线程交不回主线程时要能被报告出来，不能静默吞掉
   7. 配置写不进去时要提示，不能无声失败
   8. 拖边框能自由缩放：八个方向都能抓、对边钉住、字号同步、有上下限、有悬停提示
+  9. 更换图片 / 恢复默认图片必须真的换掉画面（不能因为渲染缓存而纹丝不动）
 
 用法：在仓库目录直接运行 `python test_gui_regressions.py`
 所有路径都相对本脚本解析，并把配置 / 账本 / 凭据重定向到临时目录，
@@ -249,6 +250,45 @@ w.root.update()
 cx = w.close_btn.winfo_rootx() - w.root.winfo_rootx() + w.close_btn.winfo_width() // 2
 cy = w.close_btn.winfo_rooty() - w.root.winfo_rooty() + w.close_btn.winfo_height() // 2
 check("默认尺寸下 ✕ 也不落在缩放区里", w._zone_at(cx, cy), None)
+
+print("\n=== 10. 更换图片 / 恢复默认图片 ===")
+try:
+    from PIL import Image
+    alt_img = os.path.join(TMP, "alt.png")
+    Image.new("RGBA", (400, 200), (255, 0, 0, 255)).save(alt_img)   # 故意做成扁的
+except Exception:
+    alt_img = None
+
+if alt_img is None:
+    print("  SKIP 环境里没有可用的 PIL")
+else:
+    real_ask = mod.filedialog.askopenfilename
+    mod.filedialog.askopenfilename = lambda **kw: alt_img
+
+    photo0 = id(w.photo)
+    w._change_image()
+    w.root.update()
+    check("更换图片后源图切到新文件", os.path.basename(w._src_path), "alt.png")
+    # 关键：换图后必须真的重建 PhotoImage。
+    # 曾经这里只比对渲染宽度，宽度只跟缩放比例有关，导致换图后画面纹丝不动。
+    check("更换图片后画面真的重建了", id(w.photo) != photo0, True)
+    check("更换图片后按新图比例缩放", (w.photo.width(), w.photo.height()), (240, 120))
+    check("更换图片写进了配置", read_saved_config().get("image"), alt_img)
+
+    photo1 = id(w.photo)
+    w._reset_image()
+    w.root.update()
+    check("恢复默认后源图回到自带素材", os.path.basename(w._src_path), "DSniang1.png")
+    check("恢复默认后画面真的重建了", id(w.photo) != photo1, True)
+    check("恢复默认后是正方形鲸鱼", (w.photo.width(), w.photo.height()), (240, 240))
+    check("恢复默认后配置里的 image 被清掉", "image" in read_saved_config(), False)
+
+    # 同一张图 + 同一尺寸时缓存仍然要生效，否则拖动边框又会变卡
+    photo2 = id(w.photo)
+    w._load_image()
+    check("同图同尺寸不重复重建 PhotoImage", id(w.photo), photo2)
+
+    mod.filedialog.askopenfilename = real_ask
 
 w.root.destroy()
 shutil.rmtree(TMP, ignore_errors=True)

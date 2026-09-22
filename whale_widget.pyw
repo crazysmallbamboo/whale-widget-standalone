@@ -325,7 +325,7 @@ class WhaleWidget:
         # 原图缓存，避免拖动边框时反复从磁盘读图
         self._src_img = None
         self._src_path = None
-        self._photo_w = None
+        self._photo_key = None   # (图片路径, 渲染宽度) —— 变了才重建 PhotoImage
 
         self._build_ui()
         self._build_menu()
@@ -457,16 +457,20 @@ class WhaleWidget:
                 self._src_path = self.image_path
             img = self._src_img
             w = max(24, int(BASE_IMG_W * self.size_scale))
-            if self.photo is not None and self._photo_w == w:
-                return  # 宽度没变，不必重建 PhotoImage
+            # 缓存的 key 必须同时包含「哪张图」和「渲染宽度」：
+            # 只比宽度的话，换图后宽度没变会直接 return，画面根本不会更新
+            # （「更换图片」「恢复默认图片」都会失效）。
+            key = (self.image_path, w)
+            if self.photo is not None and self._photo_key == key:
+                return  # 同一张图、同一个尺寸，不必重建 PhotoImage
             h = max(24, int(img.height * w / img.width))
             resized = img.resize((w, h), Image.LANCZOS)
             self.photo = ImageTk.PhotoImage(resized)
-            self._photo_w = w
+            self._photo_key = key
             self.img_label.configure(image=self.photo, text="")
         except Exception:
             self.photo = None
-            self._photo_w = None
+            self._photo_key = None
             self._src_img = None
             self._src_path = None
             self.img_label.configure(image="", text="(图片加载失败)", fg=DIM)
