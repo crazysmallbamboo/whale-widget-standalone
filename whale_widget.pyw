@@ -4,8 +4,9 @@
 - 不依赖 DeepSeek Harness，可单独运行
 - 沿用原挂件的鲸鱼娘图片素材与价格/记账逻辑
 - 显示：当前时段 token 价格、今日消费、剩余额度、本轮消耗、上一轮对话消耗
-- 支持：右键菜单调整大小、更换图片（配置持久化）
+- 支持：右键菜单调整大小、更换图片、设置 API Key（配置存仓库外）
 """
+import hashlib
 import json
 import os
 import re
@@ -15,14 +16,15 @@ import urllib.request
 import tkinter as tk
 from tkinter import filedialog
 
-# ---------------- 配置与路径 ----------------
+# ---------------- 路径 ----------------
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 WHALE_IMG = os.path.join(APP_DIR, "assets", "DSniang1.png")
+
 DSH_HOME = os.path.join(os.path.expanduser("~"), ".dsh")
 CRED_FILE = os.path.join(DSH_HOME, ".credentials.yaml")
-LEDGER_FILE = os.path.join(DSH_HOME, ".dshw-usage.json")
 SESSION_CACHE_DIR = os.path.join(DSH_HOME, "storages", "session_projcache", "sessions")
-CONFIG_FILE = os.path.join(APP_DIR, "config.json")
+DEFAULT_LEDGER = os.path.join(DSH_HOME, ".dshw-usage.json")
+
 BALANCE_URL = "https://api.deepseek.com/user/balance"
 REFRESH_MS = 60000  # 60 秒自动刷新
 
@@ -35,6 +37,61 @@ SIZE_PRESETS = {"小": 0.7, "默认": 1.0, "大": 1.4}
 BASE_IMG_W = 240
 
 
+def _user_config_path():
+    """个人配置（可能含 API Key）放在仓库外，避免被 git 误提交。"""
+    base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "whale-widget", "config.json")
+
+
+CONFIG_FILE = _user_config_path()
+LEGACY_CONFIG_FILE = os.path.join(APP_DIR, "config.json")  # 旧版位置，仅供迁移读取
+
+
+# ---------------- 配置 ----------------
+def load_config():
+    """读取个人配置：优先仓库外的新位置，其次迁移旧版（仓库内 config.json）。"""
+    for path, migrate in ((CONFIG_FILE, False), (LEGACY_CONFIG_FILE, True)):
+        try:
+            with open(path, encoding="utf-8") as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                if migrate:
+                    save_config(d)  # 从旧位置迁移到新位置
+                return d
+        except Exception:
+            continue
+    return {}
+
+
+def save_config(cfg):
+    """写入个人配置（仓库外）。返回是否成功。"""
+    try:
+        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
+
+
+def read_api_key():
+    # 1. 优先读挂件自己的配置（不依赖 DSH）
+    try:
+        cfg = load_config()
+        if cfg.get("api_key"):
+            return str(cfg["api_key"])
+    except Exception:
+        pass
+    # 2. 回退到 DSH 凭据文件
+    try:
+        with open(CRED_FILE, encoding="utf-8") as f:
+            m = re.search(r"DEEPSEEK_API_KEY:\s*(sk-\S+)", f.read())
+            return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+# ---------------- 时间 / 价格 ----------------
 def beijing_now():
     return datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
 
@@ -53,68 +110,70 @@ def current_price():
     return peak, out
 
 
-def load_config():
-    try:
-        with open(CONFIG_FILE, encoding="utf-8") as f:
-            d = json.load(f)
-            if isinstance(d, dict):
-                return d
-    except Exception:
-        pass
-    return {}
-
-
-def save_config(cfg):
-    try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False)
-    except Exception:
-        pass
-
-
-def read_api_key():
-    # 1. 优先读挂件自己的 config.json（不依赖 DSH）
-    try:
-        cfg = load_config()
-        if cfg.get("api_key"):
-            return str(cfg["api_key"])
-    except Exception:
-        pass
-    # 2. 回退到 DSH 凭据文件
-    try:
-        with open(CRED_FILE, encoding="utf-8") as f:
-            m = re.search(r"DEEPSEEK_API_KEY:\s*(sk-\S+)", f.read())
-            return m.group(1) if m else None
-    except Exception:
-        return None
-
-
+# ---------------- 账本 ----------------
 def today_key(dt=None):
     return (dt or beijing_now()).strftime("%Y-%m-%d")
 
 
-def load_ledger():
+def ledger_base_dir():
+    """账本目录：优先 ~/.dsh（与原 DSH 挂件共享），不可写则退回程序目录。"""
+    for d in (DSH_HOME, APP_DIR):
+        try:
+            os.makedirs(d, exist_ok=True)
+            probe = os.path.join(d, ".dshw-probe")
+            with open(probe, "w", encoding="utf-8") as f:
+                f.write("ok")
+            os.remove(probe)
+            return d
+        except Exception:
+            continue
+    return APP_DIR
+
+
+def ledger_path_for(key=None, manual=False):
+    """账本文件路径。
+
+    - 手动 API Key（config.json 里配置的）：按 Key 指纹隔离，切换账户互不污染
+    - DSH 凭据 / 无 Key：沿用 ~/.dsh/.dshw-usage.json（与原 DSH 挂件共享）
+    """
+    base = ledger_base_dir()
+    if manual and key:
+        fp = hashlib.sha256(str(key).encode("utf-8")).hexdigest()[:10]
+        return os.path.join(base, ".dshw-usage-%s.json" % fp)
+    return os.path.join(base, ".dshw-usage.json")
+
+
+def load_ledger(path=None):
+    path = path or DEFAULT_LEDGER
     try:
-        with open(LEDGER_FILE, encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             d = json.load(f)
-            if isinstance(d, dict) and isinstance(d.get("date"), str):
-                return d
+        if isinstance(d, dict) and isinstance(d.get("date"), str):
+            return d
     except Exception:
         pass
     return {"date": today_key(), "lastBalance": None, "todayUsage": 0,
             "history": {}, "lastCurrency": ""}
 
 
-def save_ledger(led):
+def save_ledger(led, path=None):
+    """写入账本；目录不存在会创建。返回是否成功（不再静默吞掉失败）。"""
+    path = path or DEFAULT_LEDGER
     try:
-        with open(LEDGER_FILE, "w", encoding="utf-8") as f:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(led, f, ensure_ascii=False)
+        return True
     except Exception:
-        pass
+        return False
 
 
-def record_ledger(balance, currency="CNY"):
-    led = load_ledger()
+def record_ledger(balance, currency="CNY", path=None):
+    """按余额差值累计当天消费；跨天归档，币种切换只换基准不记差值。"""
+    path = path or DEFAULT_LEDGER
+    led = load_ledger(path)
     t = today_key()
     cur = str(currency or "")
     if led.get("date") != t:
@@ -136,15 +195,15 @@ def record_ledger(balance, currency="CNY"):
     keys = sorted(led.get("history", {}))
     while len(keys) > 30:
         led["history"].pop(keys.pop(0), None)
-    save_ledger(led)
+    led["_saved"] = save_ledger(led, path)
     return led
 
 
-def fetch_balance(key):
-    req = urllib.request.Request(BALANCE_URL, headers={"Authorization": "Bearer " + key})
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    infos = data.get("balance_infos") or []
+# ---------------- 余额 ----------------
+def pick_balance_info(infos):
+    """从 balance_infos 里挑出最合适的账户余额条目（供 fetch_balance 与测试复用）。"""
+    if not isinstance(infos, list) or not infos:
+        return None
 
     def num(x):
         try:
@@ -153,18 +212,20 @@ def fetch_balance(key):
         except Exception:
             return float("nan")
 
-    info = None
     for x in infos:
         if x.get("currency") == "CNY" and num(x) > 0:
-            info = x
-            break
-    if info is None:
-        for x in infos:
-            if num(x) > 0:
-                info = x
-                break
-    if info is None:
-        info = next((x for x in infos if x.get("currency") == "CNY"), infos[0] if infos else None)
+            return x
+    for x in infos:
+        if num(x) > 0:
+            return x
+    return next((x for x in infos if x.get("currency") == "CNY"), infos[0])
+
+
+def fetch_balance(key):
+    req = urllib.request.Request(BALANCE_URL, headers={"Authorization": "Bearer " + key})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    info = pick_balance_info(data.get("balance_infos"))
     if info is None:
         raise ValueError("balance_infos 为空")
     return float(info["total_balance"]), str(info.get("currency") or "CNY")
@@ -217,7 +278,7 @@ class WhaleWidget:
         self.root.attributes("-topmost", True)
         self.root.configure(bg=BG)
 
-        # 配置：大小 + 图片
+        # 配置：大小 + 图片 + 可选 API Key
         self.config = load_config()
         self.image_path = self.config.get("image", WHALE_IMG)
         try:
@@ -226,6 +287,9 @@ class WhaleWidget:
             self.size_scale = 1.0
 
         self.api_key = read_api_key()
+        # 账本：手动 Key 按账户隔离；DSH 凭据沿用共享账本
+        self.ledger_file = ledger_path_for(self.api_key, manual=bool(self.config.get("api_key")))
+
         self.balance = None
         self.currency = "CNY"
         self.today_usage = None
@@ -233,6 +297,7 @@ class WhaleWidget:
         self.session_usage = 0.0
         self.error = None
         self._fetching = False
+        self._ledger_saved = True
 
         self._build_ui()
         self._build_menu()
@@ -319,7 +384,7 @@ class WhaleWidget:
             img = img.resize((w, h), Image.LANCZOS)
             self.photo = ImageTk.PhotoImage(img)
             self.img_label.configure(image=self.photo, text="")
-        except Exception as e:
+        except Exception:
             self.photo = None
             self.img_label.configure(image="", text="(图片加载失败)", fg=DIM)
 
@@ -347,28 +412,66 @@ class WhaleWidget:
         save_config(self.config)
         self._load_image()
 
+    def _ask_api_key(self):
+        """自建输入对话框：输入掩码显示，且不预填现有 Key（避免明文暴露）。"""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("设置 API Key")
+        dlg.configure(bg=BG)
+        dlg.attributes("-topmost", True)
+        dlg.resizable(False, False)
+        holder = {"value": None}
+
+        tk.Label(dlg, text="请输入 DeepSeek API Key（sk-...）", bg=BG, fg=FG,
+                 font=("Microsoft YaHei UI", 9)).pack(padx=16, pady=(12, 2))
+        tk.Label(dlg, text="留空确定 = 清除，改用 DSH 凭据", bg=BG, fg=DIM,
+                 font=("Microsoft YaHei UI", 8)).pack(padx=16)
+        entry = tk.Entry(dlg, width=44, show="*", font=("Consolas", 10))
+        entry.pack(padx=16, pady=8)
+        entry.focus_set()
+
+        def ok(_=None):
+            holder["value"] = entry.get()
+            dlg.destroy()
+
+        def cancel(_=None):
+            holder["value"] = None
+            dlg.destroy()
+
+        btns = tk.Frame(dlg, bg=BG)
+        btns.pack(pady=(0, 12))
+        tk.Button(btns, text="确定", width=8, command=ok).pack(side="left", padx=6)
+        tk.Button(btns, text="取消", width=8, command=cancel).pack(side="left", padx=6)
+        entry.bind("<Return>", ok)
+        dlg.bind("<Escape>", cancel)
+
+        dlg.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - dlg.winfo_width()) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - dlg.winfo_height()) // 2
+        dlg.geometry("+%d+%d" % (max(0, x), max(0, y)))
+        dlg.grab_set()
+        self.root.wait_window(dlg)
+        return holder["value"]
+
     def _set_api_key(self):
-        from tkinter import simpledialog
-        key = simpledialog.askstring(
-            "设置 API Key", "请输入 DeepSeek API Key（sk-...）：",
-            parent=self.root, initialvalue=self.api_key or "")
-        if key is not None:
-            key = key.strip()
-            if key:
-                self.config["api_key"] = key
-                save_config(self.config)
-                self.api_key = key
-            else:
-                # 清空则回退到 DSH 凭据
-                self.config.pop("api_key", None)
-                save_config(self.config)
-                self.api_key = read_api_key()
-            self.session_start = None
-            self.session_usage = 0.0
-            self._refresh()
+        key = self._ask_api_key()
+        if key is None:
+            return  # 取消
+        key = key.strip()
+        if key:
+            self.config["api_key"] = key
+            save_config(self.config)
+        else:
+            # 清空则回退到 DSH 凭据
+            self.config.pop("api_key", None)
+            save_config(self.config)
+        self.api_key = read_api_key()
+        # 账户可能已切换：重新定位账本，并重置本轮基准
+        self.ledger_file = ledger_path_for(self.api_key, manual=bool(self.config.get("api_key")))
+        self.session_start = None
+        self.session_usage = 0.0
+        self._refresh()
 
     def _rebuild_ui(self):
-        # 简单起见：销毁子控件重建（保持拖动/菜单绑定）
         for w in self.root.winfo_children():
             w.destroy()
         self._build_ui()
@@ -400,7 +503,7 @@ class WhaleWidget:
         if self._fetching:
             return
         if not self.api_key:
-            self._set_status("未找到 DEEPSEEK_API_KEY")
+            self._set_status("未找到 API Key（右键可设置）")
             return
         self._fetching = True
         threading.Thread(target=self._fetch_worker, daemon=True).start()
@@ -415,7 +518,8 @@ class WhaleWidget:
         try:
             try:
                 bal, cur = fetch_balance(self.api_key)
-                led = record_ledger(bal, cur)
+                led = record_ledger(bal, cur, self.ledger_file)
+                self._ledger_saved = led.get("_saved", True)
                 if self.session_start is None:
                     self.session_start = bal
                 self.session_usage = max(0.0, self.session_start - bal)
@@ -445,7 +549,8 @@ class WhaleWidget:
             self.lbl_lastturn.configure(text="--", fg=DIM)
 
         t = beijing_now().strftime("%H:%M:%S")
-        self._set_status("已更新 %s · %s" % (t, self.currency))
+        warn = "" if self._ledger_saved else " · 账本写入失败"
+        self._set_status("已更新 %s · %s%s" % (t, self.currency, warn))
 
     def _apply_error(self, msg):
         self.error = msg

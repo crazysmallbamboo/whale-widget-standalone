@@ -1,0 +1,14 @@
+# 统一行尾，避免 Windows / macOS / Linux 之间互相污染。
+# 注意：.bat 必须是 CRLF，否则 cmd.exe 解析批处理会出错（与 core.autocrlf 设置无关，
+# 这里显式钉死，保证 clone 和「Download ZIP」拿到的启动器都能直接用）。
+* text=auto eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制素材不做任何行尾转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary

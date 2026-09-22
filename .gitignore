@@ -3,6 +3,16 @@ __pycache__/
 *.pyc
 *.pyo
 
+# 个人配置（可能含 API Key，切勿提交）
+config.json
+
+# 账本
+usage.json
+.dshw-usage*.json
+
+# 快捷方式
+*.lnk
+
 # 开发临时文件
 test_logic.py
 test_gui.py
