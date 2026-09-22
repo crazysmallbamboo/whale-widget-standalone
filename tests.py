@@ -3,7 +3,7 @@
 
 用法：在仓库目录直接运行 `python tests.py`（不依赖任何绝对路径）。
 """
-import importlib.util, datetime, os, tempfile, json, sys
+import importlib.util, datetime, os, tempfile, json, sys, re
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODULE_PATH = os.path.join(HERE, "whale_widget.pyw")
@@ -141,6 +141,21 @@ if last is not None:
     print("   上一轮消耗 = ¥%.6f" % last)
 else:
     check("无会话数据时返回 None", last, None)
+
+print("\n=== 10. 启动器可移植性 ===")
+BAT = os.path.join(HERE, "鲸鱼余额挂件.bat")
+check("启动器与本脚本同目录存在", os.path.isfile(BAT), True)
+if os.path.isfile(BAT):
+    with open(BAT, "rb") as fh:
+        raw = fh.read()
+    # cmd.exe 按 LF 行尾解析批处理时，会把中文行的字节按 GBK 拆出 `&` 之类的
+    # 元字符并把 goto 标签认错，启动器会直接失效 —— 因此必须是 CRLF。
+    check("启动器为 CRLF 行尾（没有裸 LF）",
+          raw.count(b"\n") > 0 and raw.count(b"\n") == raw.count(b"\r\n"), True)
+    bat_text = raw.decode("utf-8")
+    # 写死绝对路径的话，换目录 / 换机器就启动不了
+    check("启动器不含盘符绝对路径", re.search(r"[A-Za-z]:\\", bat_text) is None, True)
+    check("启动器用 %~dp0 定位同目录脚本", "%~dp0" in bat_text, True)
 
 print("\n=== 结果 ===")
 print("通过 %d 项，失败 %d 项" % (passed, failed))

@@ -55,6 +55,8 @@ pip install pillow
 
 > 完全不依赖 DSH：图片素材已内置，API Key 可手动配置。想开机自启，把 `.bat` 快捷方式放进「启动」文件夹即可。
 
+> 下载：`git clone`、网页 **Code → Download ZIP**、以及单个文件下载三条路径拿到的启动器都是 CRLF 行尾（仓库用 `.gitattributes` 把 `.bat` 钉死为不转换），可以放心用。若你**自己编辑**这个 `.bat`，请务必保持 CRLF 行尾，否则 `cmd.exe` 会解析失败。
+
 ## 工作原理
 
 ### 余额
@@ -97,12 +99,14 @@ pip install pillow
 仓库自带三个**可移植**的自检脚本（不含任何硬编码路径，克隆到任意目录都能跑）：
 
 ```powershell
-python tests.py            # 38 项逻辑自检（价格表、峰谷判定、账本、币种选择、路径隔离）
+python tests.py            # 42 项逻辑自检（价格表、峰谷判定、账本、币种选择、路径隔离、启动器）
 python test_fresh_user.py  # 14 项「全新用户」模拟：拷到临时目录、清空环境，验证无 DSH 也能记账
 python test_gui_nokey.py   # 无 Key 时启动 GUI，确认不崩溃并给出「未找到 API Key」提示
 ```
 
 `tests.py` / `test_fresh_user.py` 直接调用 `whale_widget.pyw` 里的真实函数（不是复制的副本），所有路径都相对脚本自身解析，并把 `DSH_HOME` 等环境重定向到临时目录，不会污染你本机的配置与账本。
+
+其中启动器自检会断言 `鲸鱼余额挂件.bat` **必须是 CRLF 行尾、且不含任何盘符绝对路径**——这两条都是实测踩过的坑，改动启动器时会被立刻拦住。
 
 ## 借物 / 致谢
 
