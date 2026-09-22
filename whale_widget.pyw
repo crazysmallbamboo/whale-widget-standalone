@@ -11,6 +11,7 @@ import json
 import os
 import re
 import threading
+import time
 import datetime
 import urllib.request
 import tkinter as tk
@@ -35,6 +36,22 @@ PRO_PRICE = {"hit": (0.15, 0.3), "miss": (4.5, 9.0), "out": (13.5, 27.0)}
 
 SIZE_PRESETS = {"小": 0.7, "默认": 1.0, "大": 1.4}
 BASE_IMG_W = 240
+
+# ---- 边框拖拽缩放 ----
+MIN_SCALE = 0.4          # 缩放下限（240 * 0.4 = 96px 宽）
+MAX_SCALE = 3.0          # 缩放上限
+RESIZE_MARGIN = 6        # 距窗口边缘多少像素内算「抓住了边框」
+BORDER_W = 1             # 可见边框粗细
+# 拖动边框时的最小重绘间隔。Tk 每帧要重排整棵控件树并重建图片（几十毫秒），
+# 不节流的话鼠标事件会排在队列里，表现为「松手之后挂件还在继续缩放」。
+RESIZE_INTERVAL_MS = 33
+# 八个方向对应的鼠标指针
+ZONE_CURSORS = {
+    "n": "sb_v_double_arrow", "s": "sb_v_double_arrow",
+    "e": "sb_h_double_arrow", "w": "sb_h_double_arrow",
+    "ne": "size_ne_sw", "sw": "size_ne_sw",
+    "nw": "size_nw_se", "se": "size_nw_se",
+}
 
 
 def _user_config_path():
@@ -269,6 +286,7 @@ ACCENT = "#7fd0ff"
 GREEN = "#5ad0a0"
 RED = "#ff7b7b"
 GOLD = "#f0c060"
+BORDER = "#2b3550"   # 常态边框颜色（比面板略亮，能看出边界）
 
 
 class WhaleWidget:
@@ -285,6 +303,7 @@ class WhaleWidget:
             self.size_scale = float(self.config.get("size", 1.0))
         except Exception:
             self.size_scale = 1.0
+        self.size_scale = max(MIN_SCALE, min(MAX_SCALE, self.size_scale))
 
         self.api_key = read_api_key()
         # 账本：手动 Key 按账户隔离；DSH 凭据沿用共享账本
@@ -301,39 +320,58 @@ class WhaleWidget:
         self._ledger_saved = True
         self._ui_error = None
 
+        # 会随缩放变化的字体控件表：(控件, 基准字号, 是否加粗)
+        self._font_widgets = []
+        # 原图缓存，避免拖动边框时反复从磁盘读图
+        self._src_img = None
+        self._src_path = None
+        self._photo_w = None
+
         self._build_ui()
         self._build_menu()
         # 位置：优先恢复上次拖到的位置，没有（或无效）才放到右下角
         if not self._restore_pos():
             self._position_bottom_right()
 
-        # 拖动
+        # 拖动 / 边框缩放
         self._drag = None
         self._drag_origin = None
+        self._resize = None
         self.root.bind("<Button-1>", self._start_drag)
         self.root.bind("<B1-Motion>", self._do_drag)
         self.root.bind("<ButtonRelease-1>", self._end_drag)
+        self.root.bind("<Motion>", self._on_motion)
         self.root.bind("<Escape>", lambda e: self._close())
         self.root.protocol("WM_DELETE_WINDOW", self._close)
 
         self._refresh()
         self.root.after(REFRESH_MS, self._auto_refresh)
 
+    def _px(self, size):
+        """把基准字号换算成当前缩放下的像素字号。"""
+        return max(7, int(size * self.size_scale))
+
     def _font(self, size, bold=False):
         weight = "bold" if bold else "normal"
-        return ("Microsoft YaHei UI", max(7, int(size * self.size_scale)), weight)
+        return ("Microsoft YaHei UI", self._px(size), weight)
 
     def _build_ui(self):
-        outer = tk.Frame(self.root, bg=BG, bd=0)
-        outer.pack(fill="both", expand=True)
+        # 可见边框：常态是暗色描边，鼠标移到边缘准备缩放时高亮成 ACCENT
+        self.border = tk.Frame(self.root, bg=BORDER, bd=0)
+        self.border.pack(fill="both", expand=True)
+
+        outer = tk.Frame(self.border, bg=BG, bd=0)
+        outer.pack(fill="both", expand=True, padx=BORDER_W, pady=BORDER_W)
+
+        self._font_widgets = []
 
         head = tk.Frame(outer, bg=BG)
         head.pack(fill="x", padx=12, pady=(10, 0))
-        tk.Label(head, text="🐋 鲸鱼娘 · 余额", bg=BG, fg=FG,
-                 font=self._font(11, True)).pack(side="left")
-        close = tk.Label(head, text="✕", bg=BG, fg=DIM, font=self._font(12))
+        self._mk_label(head, "🐋 鲸鱼娘 · 余额", 11, True, bg=BG, fg=FG).pack(side="left")
+        close = self._mk_label(head, "✕", 12, False, bg=BG, fg=DIM)
         close.pack(side="right")
         close.bind("<Button-1>", lambda e: self._close())
+        self.close_btn = close
 
         panel = tk.Frame(outer, bg=PANEL)
         panel.pack(fill="x", padx=12, pady=8)
@@ -344,7 +382,7 @@ class WhaleWidget:
         self.lbl_turn = self._row(panel, "本轮消耗", "…", 3)
         self.lbl_lastturn = self._row(panel, "上一轮对话", "…", 4)
 
-        self.status = tk.Label(outer, text="正在加载…", bg=BG, fg=DIM, font=self._font(8))
+        self.status = self._mk_label(outer, "正在加载…", 8, False, bg=BG, fg=DIM)
         self.status.pack(fill="x", padx=12, pady=(0, 4))
 
         self.photo = None
@@ -352,6 +390,33 @@ class WhaleWidget:
         self.img_label.pack(side="bottom", fill="x")
         self.img_label.bind("<Button-1>", self._manual_refresh)
         self._load_image()
+
+    def _mk_label(self, parent, text, size, bold=False, **kw):
+        """建一个会随缩放改变字号的 Label，并登记到 _font_widgets。"""
+        lbl = tk.Label(parent, text=text, font=self._font(size, bold), **kw)
+        # 第四项是「当前已应用的像素字号」，用来判断是否真的需要重设
+        self._font_widgets.append([lbl, size, bold, self._px(size)])
+        return lbl
+
+    def _rescale_fonts(self):
+        """只对字号真的变了的控件调 configure。
+
+        Tk 每次改字体都会让整棵控件树重排，逐帧无脑重设会把拖动边框拖成幻灯片；
+        而字号只取整数像素，缩放过程中大部分帧其实没有任何一个控件需要改。
+        """
+        changed = False
+        for entry in self._font_widgets:
+            widget, size, bold = entry[0], entry[1], entry[2]
+            px = self._px(size)
+            if px == entry[3]:
+                continue
+            entry[3] = px
+            try:
+                widget.configure(font=("Microsoft YaHei UI", px, "bold" if bold else "normal"))
+                changed = True
+            except Exception:
+                pass
+        return changed
 
     def _build_menu(self):
         menu = tk.Menu(self.root, tearoff=0)
@@ -378,23 +443,49 @@ class WhaleWidget:
     def _row(self, parent, label, value, idx):
         row = tk.Frame(parent, bg=PANEL)
         row.pack(fill="x", padx=12, pady=6)
-        tk.Label(row, text=label, bg=PANEL, fg=DIM, font=self._font(9)).pack(side="left")
-        val = tk.Label(row, text=value, bg=PANEL, fg=FG, font=self._font(10, True))
+        self._mk_label(row, label, 9, False, bg=PANEL, fg=DIM).pack(side="left")
+        val = self._mk_label(row, value, 10, True, bg=PANEL, fg=FG)
         val.pack(side="right")
         return val
 
     def _load_image(self):
         try:
             from PIL import Image, ImageTk
-            img = Image.open(self.image_path).convert("RGBA")
-            w = int(BASE_IMG_W * self.size_scale)
-            h = int(img.height * w / img.width)
-            img = img.resize((w, h), Image.LANCZOS)
-            self.photo = ImageTk.PhotoImage(img)
+            # 原图缓存：拖动边框时每帧都会走到这里，不能反复读磁盘
+            if self._src_img is None or self._src_path != self.image_path:
+                self._src_img = Image.open(self.image_path).convert("RGBA")
+                self._src_path = self.image_path
+            img = self._src_img
+            w = max(24, int(BASE_IMG_W * self.size_scale))
+            if self.photo is not None and self._photo_w == w:
+                return  # 宽度没变，不必重建 PhotoImage
+            h = max(24, int(img.height * w / img.width))
+            resized = img.resize((w, h), Image.LANCZOS)
+            self.photo = ImageTk.PhotoImage(resized)
+            self._photo_w = w
             self.img_label.configure(image=self.photo, text="")
         except Exception:
             self.photo = None
+            self._photo_w = None
+            self._src_img = None
+            self._src_path = None
             self.img_label.configure(image="", text="(图片加载失败)", fg=DIM)
+
+    def _apply_scale(self, scale):
+        """按比例缩放整个挂件（图片 + 字号）。
+
+        以前是销毁重建整棵控件树，拖动边框时既慢又会闪；
+        现在只改字号和图片，控件树保持不变。
+        """
+        scale = max(MIN_SCALE, min(MAX_SCALE, float(scale)))
+        if abs(scale - self.size_scale) < 1e-4:
+            return False
+        self.size_scale = scale
+        self._rescale_fonts()
+        self._load_image()
+        # 立刻重算几何，保证调用方随后读到的 winfo_width/height 是新的
+        self.root.update_idletasks()
+        return True
 
     def _save_config_or_warn(self):
         """写配置；失败时明确提示，不要像以前那样无声无息。"""
@@ -402,11 +493,9 @@ class WhaleWidget:
             self._set_status("配置保存失败，下次打开可能不生效")
 
     def _set_size(self, scale):
-        self.size_scale = scale
-        self.config["size"] = scale
+        self._apply_scale(scale)
+        self.config["size"] = round(self.size_scale, 4)
         self._save_config_or_warn()
-        # 字体缩放需要重建 UI；重建过程里会重新加载图片，不必额外再 _load_image
-        self._rebuild_ui()
 
     def _change_image(self):
         path = filedialog.askopenfilename(
@@ -483,21 +572,6 @@ class WhaleWidget:
         self.session_usage = 0.0
         self._refresh()
 
-    def _rebuild_ui(self):
-        pos = self._current_pos()
-        prev_status = self.status.cget("text")
-        for w in self.root.winfo_children():
-            w.destroy()
-        self._build_ui()
-        # 重建后留在原地，不要把用户拖好的位置弹回右下角
-        self._move_to(pos)
-        # 把已知数据填回去，否则面板会空到下一次自动刷新
-        if self.balance is not None:
-            self._apply_data(self.balance, self.currency, self.today_usage or 0, self.last_turn)
-        elif not self.api_key:
-            self._show_placeholder()
-        self._set_status(prev_status)
-
     def _position_bottom_right(self):
         self.root.update_idletasks()
         sw = self.root.winfo_screenwidth()
@@ -538,16 +612,142 @@ class WhaleWidget:
         self._save_pos()
         self.root.destroy()
 
+    # ---------------- 拖动移动 / 拖边框缩放 ----------------
+    def _local_xy(self, e):
+        """把屏幕坐标换算成相对挂件左上角的坐标。
+
+        事件可能是被子控件收到的（Tk 会把事件继续传给 toplevel），
+        那种情况下 e.x / e.y 是相对子控件的，不能用来判断边框位置。
+        """
+        return (e.x_root - self.root.winfo_rootx(), e.y_root - self.root.winfo_rooty())
+
+    def _zone_at(self, x, y):
+        """判断 (x, y) 落在哪条边/角上；不在边缘则返回 None。"""
+        w = self.root.winfo_width()
+        h = self.root.winfo_height()
+        if w <= 2 * RESIZE_MARGIN or h <= 2 * RESIZE_MARGIN:
+            return None
+        left, right = x < RESIZE_MARGIN, x > w - RESIZE_MARGIN
+        top, bottom = y < RESIZE_MARGIN, y > h - RESIZE_MARGIN
+        if top and left:
+            return "nw"
+        if top and right:
+            return "ne"
+        if bottom and left:
+            return "sw"
+        if bottom and right:
+            return "se"
+        if top:
+            return "n"
+        if bottom:
+            return "s"
+        if left:
+            return "w"
+        if right:
+            return "e"
+        return None
+
+    def _hover(self, zone):
+        """鼠标压在边框上时换指针并点亮边框，给用户一个「这里能拖」的提示。"""
+        cur = ZONE_CURSORS.get(zone) if zone else ""
+        try:
+            self.root.configure(cursor=cur)
+            # 图片控件自己设了 hand2，会盖住窗口指针，缩放时要一起改
+            self.img_label.configure(cursor=cur or "hand2")
+            self.border.configure(bg=ACCENT if zone else BORDER)
+        except Exception:
+            pass
+
+    def _on_motion(self, e):
+        """没有按键时的移动：只负责悬停反馈。"""
+        if self._resize or self._drag:
+            return
+        x, y = self._local_xy(e)
+        self._hover(self._zone_at(x, y))
+
     def _start_drag(self, e):
+        x, y = self._local_xy(e)
+        zone = self._zone_at(x, y)
+        if zone:
+            # 抓在边框上 → 缩放，而不是移动整个挂件
+            self._resize = {
+                "zone": zone,
+                "scale": self.size_scale,
+                "pos": self._current_pos(),
+                "size": (self.root.winfo_width(), self.root.winfo_height()),
+                "origin": (e.x_root, e.y_root),
+                "t": None,
+                "last": (e.x_root, e.y_root),
+            }
+            self._drag = None
+            return
         self._drag = (e.x_root - self.root.winfo_x(), e.y_root - self.root.winfo_y())
         self._drag_origin = self._current_pos()
 
     def _do_drag(self, e):
+        if self._resize:
+            self._do_resize(e.x_root, e.y_root)
+            return
         if self._drag:
             self.root.geometry("+%d+%d" % (e.x_root - self._drag[0], e.y_root - self._drag[1]))
 
+    def _do_resize(self, x_root, y_root, force=False):
+        """等比缩放：拖哪条边就以对边为锚点，锚点位置保持不动。"""
+        r = self._resize
+        if not r:
+            return
+        r["last"] = (x_root, y_root)
+        now = time.monotonic()
+        if not force and r["t"] is not None and (now - r["t"]) * 1000 < RESIZE_INTERVAL_MS:
+            return  # 节流：这一帧丢掉，松手时还会用最后的位置补一次
+        r["t"] = now
+
+        dx = x_root - r["origin"][0]
+        dy = y_root - r["origin"][1]
+        zone = r["zone"]
+        west = zone in ("w", "nw", "sw")
+        east = zone in ("e", "ne", "se")
+        north = zone in ("n", "ne", "nw")
+        south = zone in ("s", "se", "sw")
+        sw, sh = r["size"]
+        if sw <= 0 or sh <= 0:
+            return
+
+        if east:
+            target_w = sw + dx
+        elif west:
+            target_w = sw - dx
+        else:
+            # 只拖上下边时按高度换算成宽度，保持等比
+            target_h = (sh + dy) if south else (sh - dy)
+            target_w = sw * (target_h / float(sh))
+
+        if not self._apply_scale(r["scale"] * (target_w / float(sw))):
+            return
+
+        # _apply_scale 里已经 update_idletasks 过，这里直接读新尺寸，
+        # 把锚点挪回去让对边钉在原地（不必再排一次版）
+        nw = self.root.winfo_width()
+        nh = self.root.winfo_height()
+        x, y = r["pos"]
+        if west:
+            x = r["pos"][0] + sw - nw
+        if north:
+            y = r["pos"][1] + sh - nh
+        self._move_to((x, y))
+
     def _end_drag(self, e=None):
-        """拖动结束才写配置，且位置没变就不写（避免每次点击都落盘）。"""
+        """松手才写配置，且没变就不写（避免每次点击都落盘）。"""
+        if self._resize:
+            last = self._resize.get("last")
+            if last:
+                # 补一次最终位置，把被节流丢掉的那一小段补上
+                self._do_resize(last[0], last[1], force=True)
+            self._resize = None
+            self._hover(None)
+            self.config["size"] = round(self.size_scale, 4)
+            self._save_config_or_warn()
+            return
         if self._drag is None:
             return
         self._drag = None
@@ -555,6 +755,10 @@ class WhaleWidget:
             self._save_pos()
 
     def _manual_refresh(self, e=None):
+        if e is not None:
+            x, y = self._local_xy(e)
+            if self._zone_at(x, y):
+                return  # 点在边框上是在缩放，不是要刷新
         self._refresh()
 
     def _auto_refresh(self):
