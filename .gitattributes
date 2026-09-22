@@ -7,8 +7,10 @@
 # 这里用 `-text -eol` 彻底关闭行尾转换，让仓库里的 blob 本身就带 CRLF。
 # 注意两个都要取消：只写 `-text` 的话，上面那条 `* text=auto eol=lf` 设下的
 # `eol=lf` 仍然生效，blob 依旧会被存成 LF（踩过一次，clone 出来直接失效）。
-# 这样 clone、网页「Download ZIP」、以及 raw 单文件下载三条路径拿到的都是 CRLF；
-# 若改用 `text eol=crlf`，raw 仍会吐出 LF 而把人坑到。
+# 这样 clone 与网页「Download ZIP」拿到的都是 CRLF（实测均为 977 字节）。
+# 注意 raw.githubusercontent.com 这个视图会自行把 CRLF 转成 LF，无论属性怎么设
+# 都救不回来（实测 blob 为 977 字节 CRLF，raw 仍返回 938 字节 LF），
+# 因此 README 里明确要求用户用 clone 或 Download ZIP，不要单独保存 .bat。
 # 代价：改动该文件时必须保持 CRLF（tests.py 里有对应的 CRLF 自检）。
 *.bat -text -eol
 *.cmd -text -eol

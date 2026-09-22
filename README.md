@@ -55,7 +55,11 @@ pip install pillow
 
 > 完全不依赖 DSH：图片素材已内置，API Key 可手动配置。想开机自启，把 `.bat` 快捷方式放进「启动」文件夹即可。
 
-> 下载：`git clone`、网页 **Code → Download ZIP**、以及单个文件下载三条路径拿到的启动器都是 CRLF 行尾（仓库用 `.gitattributes` 把 `.bat` 钉死为不转换），可以放心用。若你**自己编辑**这个 `.bat`，请务必保持 CRLF 行尾，否则 `cmd.exe` 会解析失败。
+> **下载方式**：请用 `git clone` 或网页 **Code → Download ZIP**。这两条路径拿到的启动器都是 CRLF 行尾（仓库已用 `.gitattributes` 把 `.bat` 钉死为不做任何行尾转换）。
+>
+> ⚠️ **不要**在 GitHub 文件页上右键单独保存或直接下载 `.bat`：raw 视图会把行尾转成 LF，而 `cmd.exe` 解析 LF 行尾的批处理会直接失败（连 `set` 语句都会从中间断开）。若你已经被这样坑到，直接运行 `pythonw whale_widget.pyw` 效果完全一样，或重新用 ZIP 下载。
+>
+> 如果你**自己编辑**这个 `.bat`，也请务必保持 CRLF 行尾——`tests.py` 里有对应的自检会拦住。
 
 ## 工作原理
 
