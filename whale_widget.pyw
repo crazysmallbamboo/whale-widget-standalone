@@ -293,21 +293,28 @@ class WhaleWidget:
         self.balance = None
         self.currency = "CNY"
         self.today_usage = None
+        self.last_turn = None
         self.session_start = None
         self.session_usage = 0.0
         self.error = None
         self._fetching = False
         self._ledger_saved = True
+        self._ui_error = None
 
         self._build_ui()
         self._build_menu()
-        self._position_bottom_right()
+        # 位置：优先恢复上次拖到的位置，没有（或无效）才放到右下角
+        if not self._restore_pos():
+            self._position_bottom_right()
 
         # 拖动
         self._drag = None
+        self._drag_origin = None
         self.root.bind("<Button-1>", self._start_drag)
         self.root.bind("<B1-Motion>", self._do_drag)
-        self.root.bind("<Escape>", lambda e: self.root.destroy())
+        self.root.bind("<ButtonRelease-1>", self._end_drag)
+        self.root.bind("<Escape>", lambda e: self._close())
+        self.root.protocol("WM_DELETE_WINDOW", self._close)
 
         self._refresh()
         self.root.after(REFRESH_MS, self._auto_refresh)
@@ -326,7 +333,7 @@ class WhaleWidget:
                  font=self._font(11, True)).pack(side="left")
         close = tk.Label(head, text="✕", bg=BG, fg=DIM, font=self._font(12))
         close.pack(side="right")
-        close.bind("<Button-1>", lambda e: self.root.destroy())
+        close.bind("<Button-1>", lambda e: self._close())
 
         panel = tk.Frame(outer, bg=PANEL)
         panel.pack(fill="x", padx=12, pady=8)
@@ -356,8 +363,9 @@ class WhaleWidget:
         menu.add_command(label="恢复默认图片", command=self._reset_image)
         menu.add_command(label="设置 API Key", command=self._set_api_key)
         menu.add_command(label="立即刷新", command=self._manual_refresh)
+        menu.add_command(label="回到右下角", command=self._position_bottom_right)
         menu.add_separator()
-        menu.add_command(label="关闭", command=self.root.destroy)
+        menu.add_command(label="关闭", command=self._close)
         self.menu = menu
         self.root.bind("<Button-3>", self._popup_menu)
 
@@ -388,12 +396,16 @@ class WhaleWidget:
             self.photo = None
             self.img_label.configure(image="", text="(图片加载失败)", fg=DIM)
 
+    def _save_config_or_warn(self):
+        """写配置；失败时明确提示，不要像以前那样无声无息。"""
+        if not save_config(self.config):
+            self._set_status("配置保存失败，下次打开可能不生效")
+
     def _set_size(self, scale):
         self.size_scale = scale
         self.config["size"] = scale
-        save_config(self.config)
-        self._load_image()
-        # 字体缩放需要重建 UI
+        self._save_config_or_warn()
+        # 字体缩放需要重建 UI；重建过程里会重新加载图片，不必额外再 _load_image
         self._rebuild_ui()
 
     def _change_image(self):
@@ -403,13 +415,13 @@ class WhaleWidget:
         if path:
             self.image_path = path
             self.config["image"] = path
-            save_config(self.config)
+            self._save_config_or_warn()
             self._load_image()
 
     def _reset_image(self):
         self.image_path = WHALE_IMG
         self.config.pop("image", None)
-        save_config(self.config)
+        self._save_config_or_warn()
         self._load_image()
 
     def _ask_api_key(self):
@@ -472,10 +484,19 @@ class WhaleWidget:
         self._refresh()
 
     def _rebuild_ui(self):
+        pos = self._current_pos()
+        prev_status = self.status.cget("text")
         for w in self.root.winfo_children():
             w.destroy()
         self._build_ui()
-        self._position_bottom_right()
+        # 重建后留在原地，不要把用户拖好的位置弹回右下角
+        self._move_to(pos)
+        # 把已知数据填回去，否则面板会空到下一次自动刷新
+        if self.balance is not None:
+            self._apply_data(self.balance, self.currency, self.today_usage or 0, self.last_turn)
+        elif not self.api_key:
+            self._show_placeholder()
+        self._set_status(prev_status)
 
     def _position_bottom_right(self):
         self.root.update_idletasks()
@@ -483,36 +504,96 @@ class WhaleWidget:
         sh = self.root.winfo_screenheight()
         w = self.root.winfo_width()
         h = self.root.winfo_height()
-        self.root.geometry("+%d+%d" % (sw - w - 24, sh - h - 24))
+        self._move_to((sw - w - 24, sh - h - 24))
+
+    def _move_to(self, pos):
+        try:
+            self.root.geometry("+%d+%d" % (int(pos[0]), int(pos[1])))
+        except Exception:
+            pass
+
+    def _current_pos(self):
+        return [self.root.winfo_x(), self.root.winfo_y()]
+
+    def _restore_pos(self):
+        """恢复上次的窗口位置；没有或明显损坏时返回 False（交给右下角兜底）。"""
+        pos = self.config.get("pos")
+        if not (isinstance(pos, (list, tuple)) and len(pos) == 2):
+            return False
+        try:
+            x, y = int(pos[0]), int(pos[1])
+        except Exception:
+            return False
+        # 允许副屏的负坐标，只挡掉明显损坏的值
+        if not (-20000 < x < 20000 and -20000 < y < 20000):
+            return False
+        self._move_to((x, y))
+        return True
+
+    def _save_pos(self):
+        self.config["pos"] = self._current_pos()
+        return save_config(self.config)
+
+    def _close(self):
+        self._save_pos()
+        self.root.destroy()
 
     def _start_drag(self, e):
         self._drag = (e.x_root - self.root.winfo_x(), e.y_root - self.root.winfo_y())
+        self._drag_origin = self._current_pos()
 
     def _do_drag(self, e):
         if self._drag:
             self.root.geometry("+%d+%d" % (e.x_root - self._drag[0], e.y_root - self._drag[1]))
 
+    def _end_drag(self, e=None):
+        """拖动结束才写配置，且位置没变就不写（避免每次点击都落盘）。"""
+        if self._drag is None:
+            return
+        self._drag = None
+        if self._current_pos() != self._drag_origin:
+            self._save_pos()
+
     def _manual_refresh(self, e=None):
         self._refresh()
 
     def _auto_refresh(self):
+        self._report_ui_error()
         self._refresh()
         self.root.after(REFRESH_MS, self._auto_refresh)
+
+    def _report_ui_error(self):
+        """把后台线程交不回主线程的失败显示出来（以前是静默吞掉）。"""
+        if self._ui_error:
+            msg, self._ui_error = self._ui_error, None
+            self._set_status("界面更新失败: %s" % msg[:60])
+
+    def _show_placeholder(self):
+        """没有 API Key 时：价格是本地按时间算的，仍显示；余额类显示 --。"""
+        peak, price = current_price()
+        self.lbl_price.configure(text="%s ¥%.2f/M" % ("峰价" if peak else "谷价", price), fg=GOLD)
+        for lbl in (self.lbl_today, self.lbl_bal, self.lbl_turn, self.lbl_lastturn):
+            lbl.configure(text="--", fg=DIM)
 
     def _refresh(self):
         if self._fetching:
             return
         if not self.api_key:
+            self._show_placeholder()
             self._set_status("未找到 API Key（右键可设置）")
             return
         self._fetching = True
         threading.Thread(target=self._fetch_worker, daemon=True).start()
 
     def _safe_after(self, fn, *args):
+        """把回调交给主线程。失败时记录下来由主线程报告——
+        不能像以前那样 except: pass，否则界面会永远不更新且毫无提示。"""
         try:
             self.root.after(0, fn, *args)
-        except Exception:
-            pass
+            return True
+        except Exception as e:
+            self._ui_error = "%s: %s" % (type(e).__name__, e)
+            return False
 
     def _fetch_worker(self):
         try:
@@ -523,8 +604,9 @@ class WhaleWidget:
                 if self.session_start is None:
                     self.session_start = bal
                 self.session_usage = max(0.0, self.session_start - bal)
-                last_turn = read_last_turn_cost()
-                self._safe_after(self._apply_data, bal, cur, led.get("todayUsage") or 0, last_turn)
+                self.last_turn = read_last_turn_cost()
+                self._safe_after(self._apply_data, bal, cur,
+                                 led.get("todayUsage") or 0, self.last_turn)
             except Exception as e:
                 self._safe_after(self._apply_error, str(e))
         finally:
@@ -534,6 +616,7 @@ class WhaleWidget:
         self.balance = bal
         self.currency = cur
         self.today_usage = today
+        self.last_turn = last_turn
         self.error = None
 
         peak, price = current_price()
@@ -554,11 +637,13 @@ class WhaleWidget:
 
     def _apply_error(self, msg):
         self.error = msg
-        self.lbl_price.configure(text="…", fg=GOLD)
-        self.lbl_today.configure(text="--", fg=FG)
-        self.lbl_bal.configure(text="--", fg=FG)
-        self.lbl_turn.configure(text="--", fg=FG)
-        self.lbl_lastturn.configure(text="--", fg=DIM)
+        # 价格是本地按时间算的，与 API 无关，失败时照样显示
+        peak, price = current_price()
+        self.lbl_price.configure(text="%s ¥%.2f/M" % ("峰价" if peak else "谷价", price), fg=DIM)
+        # 保留上一次成功拿到的数字，只调暗表示「已过期」——
+        # 一次网络抖动不该把已经显示出来的余额和消费清成 --。
+        for lbl in (self.lbl_today, self.lbl_bal, self.lbl_turn, self.lbl_lastturn):
+            lbl.configure(fg=DIM)
         self._set_status("拉取失败: %s" % msg[:60])
 
     def _set_status(self, text):
